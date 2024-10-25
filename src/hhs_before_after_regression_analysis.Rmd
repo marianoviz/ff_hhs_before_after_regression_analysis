@@ -1,0 +1,2005 @@
+---
+title: "Before-After Standardized Effect Size Analysis for HHS Data Across Sites"
+author: "Mariano Viz"
+date: "2024-10-25"
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_depth: 4
+    toc_float:
+      collapsed: false      
+      smooth_scroll: true
+editor_options:
+  markdown:
+    wrap: sentence
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, collapse = TRUE, comment = "#>", fig.align = 'center')
+
+
+library(tidyverse)
+library(here)
+library(janitor)
+library(effsize)
+library(jsonlite)
+library(readxl)
+library(data.world)
+library(lmtest)
+library(sandwich)
+library(broom)
+library(rstatix)
+library(gridExtra)
+
+```
+
+```{r}
+# Read in data
+
+# Read in Biomass data
+bio_ma <- read_excel(here("data", "raw","Aggregated Data.xlsx"), sheet = "MA - Biomass by year")
+bio_reserve <- read_excel(here("data", "raw","Aggregated Data.xlsx"), sheet = "Reserve - Biomass by year")
+
+# Read in HHS data
+fastfield <- read_csv(here("data", "raw", "hhs_fastfield.csv"))
+#kobo_1 <- read_excel(here("data", "raw", "hhs_kobo_mod_1.xlsx")) # Same as fp
+kobo_1_fp <- read_csv(here("data", "raw", "hhs_fp.csv"))
+#kobo_2 <- read_excel(here("data", "raw", "hhs_kobo_mod_2.xlsx")) # Same as fp (divided for hon and phi)
+# devtools::install_github("datadotworld/data.world-r")
+# devtools::install_github("datadotworld/dwapi-r")
+dwapi::configure(auth_token = "eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJyLWFuZC1yLXN0dWRpbzptYXJpYW5vdml6IiwiaXNzIjoiY2xpZW50OnItYW5kLXItc3R1ZGlvOmFnZW50Om1hcmlhbm92aXo6OjEyYzRkOTYzLTk0NDctNDg5Ni04ZmM0LTQ5YTM1ZWQ2MWQ0NSIsImlhdCI6MTcyODUwNTU0MCwicm9sZSI6WyJ1c2VyX2FwaV9hZG1pbiIsInVzZXJfYXBpX3JlYWQiLCJ1c2VyX2FwaV93cml0ZSJdLCJnZW5lcmFsLXB1cnBvc2UiOnRydWUsInNhbWwiOnt9fQ.MSVsDGnQK4y3WWiWYrDluIYsojOmmbrJC-PeFSgZY7qDq63pIobopiDTHcaCX8LG7pwuBC5HBQrO8Kk8ifahpQ")
+sql_stmt <- qry_sql("SELECT * FROM hhs_fp_hnd")  
+kobo_2_fp_hon <- data.world::query(
+  sql_stmt, "rare/household-surveys"
+)
+kobo_2_fp_phi <- read_csv(here("data", "raw", "hhs_fp_phl.csv"))
+#kobo_3 <- read_excel(here("data", "raw", "hhs_kobo_mod_3.xlsx")) #Check which sheets are relevant!
+#kobo_3_fp_ind <- read_csv(here("data", "raw", "hhs_fp_idn.csv")) #No matching sites
+
+
+```
+
+```{r}
+# Get Sites
+
+# Get unique sites from biomass data
+  # sites <- bind_rows(
+  #   select(bio_reserve, ma_name, country),
+  #   select(bio_ma, ma_name, country)
+  # )
+  # 
+  # sites <- distinct(sites)
+
+
+# To keep only sites with more than 1 biomass observation (more than 1 for ma or reserve)
+bio_reserve_filtered <- bio_reserve %>%
+  group_by(ma_name) %>%
+  tally() %>%
+  filter(n > 1) %>%
+  select(ma_name)
+
+bio_reserve <- bio_reserve %>%
+  filter(ma_name %in% bio_reserve_filtered$ma_name)
+
+
+bio_ma_filtered <- bio_ma %>%
+  group_by(ma_name) %>%
+  tally() %>%
+  filter(n > 1) %>%
+  select(ma_name)
+
+bio_ma <- bio_ma %>%
+  filter(ma_name %in% bio_ma_filtered$ma_name)
+
+sites <- bind_rows(
+  select(bio_reserve, ma_name, country),
+  select(bio_ma, ma_name, country)
+)
+
+sites <- distinct(sites)
+
+
+# Check (biomass) sites present in the HHS data
+
+# Convert all sites to ma_name and to snake case lowercase
+sites$ma_name <- tolower(gsub(" ", "_", sites$ma_name))
+fastfield$ma_name <- tolower(gsub(" ", "_", fastfield$maa))
+kobo_1_fp$ma_name <- tolower(gsub(" ", "_", kobo_1_fp$ma_name))
+kobo_2_fp_hon$ma_name <- tolower(gsub(" ", "_", kobo_2_fp_hon$ma_name))
+kobo_2_fp_phi$ma_name <- tolower(gsub(" ", "_", kobo_2_fp_phi$level4_name))
+
+# Filter HHS data
+fastfield <- fastfield %>%
+  filter(ma_name %in% sites$ma_name)
+
+kobo_1_fp <- kobo_1_fp %>%
+  filter(ma_name %in% sites$ma_name)
+
+kobo_2_fp_hon <- kobo_2_fp_hon  %>%
+  filter(ma_name %in% sites$ma_name)
+
+kobo_2_fp_phi <- kobo_2_fp_phi %>%
+  filter(ma_name %in% sites$ma_name) # No matching sites
+
+# Get years
+kobo_1_fp$year <- year(ymd(kobo_1_fp$submission_time)) 
+kobo_2_fp_hon$year <- year(ymd(kobo_2_fp_hon$submission_time))
+
+```
+
+## Summary
+
+In this analysis, I sought to evaluate the perceptions and outcomes of fisheries management, community well-being, and household livelihoods across multiple sites that were initially chosen in a prior analysis, [*Evaluating Biomass Change: Regression Analysis and Diagnostics in Fish Forever Areas*](https://rpubs.com/marianoviz/ff_biomass_change).
+Using household survey (HHS) data, I applied a before-after regression approach to quantify the changes in responses over time for various questions related to fish catch, fisheries management, food security, and household income.
+Each question from the survey was mapped to a 0-100 scale, converting ordinal and binary responses into continuous variables.
+The analysis then compared mean responses from the earliest (before) and most recent (after) years of data collection at each site.
+
+To estimate the effect size of changes between these periods, I used robust linear regression models with heteroscedasticity-corrected standard errors.
+For each site, I calculated standardized effect sizes (β1) and generated 95% confidence intervals to assess the magnitude and direction of the changes.
+The results were visualized to indicate whether these changes were statistically significant and whether they were positive or negative.
+
+**Summary of Results**
+
+The analysis of before-after effect sizes across the different sites revealed a lack of consistent patterns or trends across the data.
+While some questions showed statistically significant changes, the majority of the results were either insignificant or varied considerably across different sites and questions.
+
+-   **Variability of Effect Sizes**: The effect sizes across the sites showed substantial variation.
+    Some questions demonstrated large positive changes, suggesting improvements, while others showed negative or negligible changes.
+
+-   **Lack of Consistency**: Similar questions yielded inconsistent results across different locations.
+    For instance, a question that showed a positive effect at one site could show a negative or insignificant effect at another site, making it difficult to establish a clear or consistent trend.
+
+-   **Significance**: Although some results were statistically significant (p \< 0.05), these significant changes were scattered and did not form a coherent trend across sites or questions.
+    Many questions either lacked significance or produced results that varied too much to establish any definitive conclusions.
+
+[Given the high variability and inconsistency in the results, it is not possible to observe consistent trends or draw broad conclusions about the changes in the assessed variables]{.underline}.
+
+------------------------------------------------------------------------
+
+***Interpretation of Effect Sizes (β1)**:*
+
+-   ***For Ordinal Questions***[^1]: The effect size (β1) represents the average change in responses on a 0-100 scale between the "before" and "after" periods.
+    A positive effect size indicates an increase in the perception or agreement level, while a negative effect size suggests a decline.
+
+-   ***For Binary Questions***[^2]: The effect size (β1) reflects the change in the probability of a "Yes" response in the after period.
+    Positive values imply an increase in the probability of a "Yes" response, while negative values indicate a decline.
+
+[^1]: ***Ordinal questions rank responses on a scale with ordered categories, allowing for varying levels of intensity (e.g., "very low" to "very high").***
+
+[^2]: ***Binary questions offer only two possible answers, typically "Yes" or "No," without any gradation.***
+
+------------------------------------------------------------------------
+
+## Question 21
+
+*Compared to 2 years ago, the current fish catch has...*
+
+Possible answers:
+
+1.  Declined a lot
+
+2.  Declined slightly
+
+3.  Stayed the same
+
+4.  Improved slightly
+
+5.  Improved heavily
+
+```{r}
+# Find data
+# colnames(fastfield)[grepl("21", colnames(fastfield))]
+# colnames(kobo_1_fp)[grepl("fish_catch'", colnames(kobo_1_fp))]
+# colnames(kobo_2_fp_hon)[grepl("fish_catch'", colnames(kobo_2_fp_hon))]
+
+# Select Q21, site, year
+fastfield_q21 <- fastfield %>% 
+  select(ma_name, year, '21_current_fish_catch')
+fastfield_q21$'21_current_fish_catch'<- tolower(gsub(" ", "_", fastfield_q21$'21_current_fish_catch'))
+
+kobo_1_fp_q21 <- kobo_1_fp %>% 
+  select(ma_name, year, '21_current_fish_catch')
+kobo_1_fp_q21$'21_current_fish_catch'<- tolower(gsub(" ", "_", kobo_1_fp_q21$'21_current_fish_catch'))
+
+kobo_2_fp_hon_q21 <- kobo_2_fp_hon %>% 
+  select(ma_name, year, '17_current_fish_catch') # here is the question 17!
+kobo_2_fp_hon_q21$'21_current_fish_catch'<- tolower(gsub(" ", "_", kobo_2_fp_hon_q21$'17_current_fish_catch')) #change column name
+kobo_2_fp_hon_q21 <- kobo_2_fp_hon_q21 %>% 
+  select(ma_name, year, '21_current_fish_catch')
+
+# Check answers
+# Possible answers: 
+# 1. Declined a lot
+# 2. Declined slightly
+# 3. Stayed the same
+# 4. Improved slightly
+# 5. Improved heavily
+# unique(fastfield_q21$`21_current_fish_catch`)
+# unique(kobo_1_fp_q21$`21_current_fish_catch`)
+# unique(kobo_2_fp_hon_q21$`21_current_fish_catch`)
+
+# Replace "declined_alot" with "declined_a_lot"
+kobo_1_fp_q21$`21_current_fish_catch` <- gsub("declined_alot", "declined_a_lot", kobo_1_fp_q21$`21_current_fish_catch`)
+kobo_2_fp_hon_q21$`21_current_fish_catch` <- gsub("declined_alot", "declined_a_lot", kobo_2_fp_hon_q21$`21_current_fish_catch`)
+
+ 
+# Combine datasets
+q21 <- bind_rows(
+  select(fastfield_q21, ma_name, year, `21_current_fish_catch`),
+  select(kobo_1_fp_q21, ma_name, year, `21_current_fish_catch`),
+  select(kobo_2_fp_hon_q21, ma_name, year, `21_current_fish_catch`)
+)
+
+# Remove sites with only one hhs (year)
+q21 <- q21 %>%
+  group_by(ma_name) %>%
+  filter(n_distinct(year) > 1) %>%
+  ungroup() # goes from 31 to 28 sites
+
+# Remove answers like "not a fisher", NAs, etc
+answers <- c("declined_slightly", "declined_a_lot", "improved_slightly", "stayed_the_same", "improved_heavily")
+q21 <- q21 %>%
+  filter(`21_current_fish_catch` %in% answers)
+
+# Check different years for each ma_name
+q_21_years_by_site <- q21 %>%
+  group_by(ma_name) %>%
+  summarise(years = list(unique(year)))
+
+# Ordinal to continuous mapping (answers in a continuos scale 0-100)
+q21 <- q21 %>%
+  mutate(q21_continuous = case_when(
+    `21_current_fish_catch` == "declined_a_lot" ~ 0,
+    `21_current_fish_catch` == "declined_slightly" ~ 25,
+    `21_current_fish_catch` == "stayed_the_same" ~ 50,
+    `21_current_fish_catch` == "improved_slightly" ~ 75,
+    `21_current_fish_catch` == "improved_heavily" ~ 100
+  )) %>% 
+  group_by(ma_name) %>%
+  mutate(period = case_when(
+    year == min(year) ~ "before",
+    year == max(year) ~ "after"
+  )) %>%
+  ungroup()
+
+# Calculate average of q21 per site per year
+q21_summary <- q21 %>%
+  group_by(ma_name, year, period) %>%
+  summarise(avg_q21_continuous = mean(q21_continuous, na.rm = TRUE)) %>%
+  ungroup()
+
+
+before_after_avg <- q21_summary %>%
+  group_by(period) %>%
+  summarise(overall_avg_q21 = mean(avg_q21_continuous, na.rm = TRUE))
+
+# Custom function for linear regression with robust standard errors
+q21 <- q21 %>%
+  mutate(period = factor(period, levels = c("before", "after")))
+
+lm_robust <- function(df) {
+  lm(q21_continuous ~ period, data = df) %>%
+    coeftest(vcov = sandwich::vcovHC(., "HC1")) # Robust standard errors (HC1 correction)
+}
+
+# Run the regression for each site and extract the before-after coefficient
+before_after_models <- q21 %>%
+  group_by(ma_name) %>%
+  do(tidy(lm(q21_continuous ~ period, data = .), conf.int = TRUE)) %>%
+  filter(term == "periodafter")
+
+# Add 95% confidence intervals
+before_after_models <- before_after_models %>%
+  mutate(conf.high.95 = estimate + 1.96 * std.error,
+         conf.low.95 = estimate - 1.96 * std.error)
+
+# Plot the effect size (β1) for each site
+before_after_models <- before_after_models %>%
+  mutate(
+    significance = case_when(
+      p.value < 0.05 & estimate > 0 ~ "Positive (p < 0.05)",
+      p.value < 0.05 & estimate < 0 ~ "Negative (p < 0.05)",
+      p.value >= 0.05 ~ "Not Significant"
+    ),
+    # Set colors for plotting
+    color = case_when(
+      p.value < 0.05 & estimate > 0 ~ "forestgreen",    
+      p.value < 0.05 & estimate < 0 ~ "purple",         
+      p.value >= 0.05 ~ "white"                       
+    )
+  )
+
+
+before_after_models %>%
+  ggplot(aes(x = reorder(ma_name, estimate), y = estimate, fill = significance)) +
+  geom_point(shape = 21, size = 3, color = "black") +  
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.2) +
+  scale_fill_manual(values = c("Positive (p < 0.05)" = "forestgreen", 
+                               "Negative (p < 0.05)" = "purple", 
+                               "Not Significant" = "white")) +  
+  coord_flip() +
+  labs(x = "Site", y = "Effect Size (β1)", 
+       title = "Before–after standardized effect sizes for Q21 by Site",
+       fill = "Change") +
+  theme_minimal()
+
+
+# Interpretation: For example, for memba-sede, the effect size of approximately -35 means that, on average, the responses to the question about fish catch perception decreased by about 35 points (on the 0-100 scale) for the period after compared to before. This means that respondents perceived fish catch as having significantly worsened by approximately 35 points on the 0-100 scale.
+
+```
+
+## Question 24
+
+*In the next 5 years, how do you think the fish catch will be compared to today?*
+
+Possible answers:
+
+1.  Declines a lot
+
+2.  Declines slightly
+
+3.  Stays the same
+
+4.  Improves slightly
+
+5.  Improves heavily
+
+```{r}
+# Find data
+# colnames(fastfield)[grepl("24", colnames(fastfield))]
+# colnames(kobo_1_fp)[grepl("catch_5yr'", colnames(kobo_1_fp))]
+# colnames(kobo_2_fp_hon)[grepl("catch_5yr'", colnames(kobo_2_fp_hon))]
+
+# Select Q24, site, year
+fastfield_q24 <- fastfield %>% 
+  select(ma_name, year, '24_catch_5yrs')
+fastfield_q24$'24_catch_5yrs'<- tolower(gsub(" ", "_", fastfield_q24$'24_catch_5yrs'))
+
+kobo_1_fp_q24 <- kobo_1_fp %>% 
+  select(ma_name, year, '24_catch_5yrs')
+kobo_1_fp_q24$'24_catch_5yrs'<- tolower(gsub(" ", "_", kobo_1_fp_q24$'24_catch_5yrs'))
+
+kobo_2_fp_hon_q24 <- kobo_2_fp_hon %>% 
+  select(ma_name, year, '19_catch_5yrs') # here is the question 19!
+kobo_2_fp_hon_q24$'24_catch_5yrs'<- tolower(gsub(" ", "_", kobo_2_fp_hon_q24$'19_catch_5yrs')) #change column name
+kobo_2_fp_hon_q24 <- kobo_2_fp_hon_q24 %>% 
+  select(ma_name, year, '24_catch_5yrs')
+
+# Check answers
+# Possible answers: 
+# 1. Declines a lot
+# 2. Declines slightly
+# 3. Stays the same
+# 4. Improves slightly
+# 5. Improves heavily
+# unique(fastfield_q24$`24_catch_5yrs`)
+# unique(kobo_1_fp_q24$`24_catch_5yrs`)
+# unique(kobo_2_fp_hon_q24$`24_catch_5yrs`)
+
+# Replace "declined_alot" with "declined_a_lot"
+kobo_1_fp_q24$`24_catch_5yrs` <- gsub("declines_alot", "declines_a_lot", kobo_1_fp_q24$`24_catch_5yrs`)
+kobo_2_fp_hon_q24$`24_catch_5yrs` <- gsub("declines_alot", "declines_a_lot", kobo_2_fp_hon_q24$`24_catch_5yrs`)
+
+ 
+# Combine datasets
+q24 <- bind_rows(
+  select(fastfield_q24, ma_name, year, `24_catch_5yrs`),
+  select(kobo_1_fp_q24, ma_name, year, `24_catch_5yrs`),
+  select(kobo_2_fp_hon_q24, ma_name, year, `24_catch_5yrs`)
+)
+
+
+# Remove answers like "not a fisher", NAs, etc
+answers_q24 <- c("declines_slightly", "declines_a_lot", "improves_slightly", "stays_the_same", "improves_heavily")
+q24 <- q24 %>%
+  filter(`24_catch_5yrs` %in% answers_q24)
+
+# Check different years for each ma_name
+q_24_years_by_site <- q24 %>%
+  group_by(ma_name) %>%
+  summarise(years = list(unique(year)))
+
+# Remove sites with only one hhs (year)
+q24 <- q24 %>%
+  group_by(ma_name) %>%
+  filter(n_distinct(year) > 1) %>%
+  ungroup() 
+
+# Ordinal to continuous mapping (answers in a continuos scale 0-100)
+q24 <- q24 %>%
+  mutate(q24_continuous = case_when(
+    `24_catch_5yrs` == "declines_a_lot" ~ 0,
+    `24_catch_5yrs` == "declines_slightly" ~ 25,
+    `24_catch_5yrs` == "stays_the_same" ~ 50,
+    `24_catch_5yrs` == "improves_slightly" ~ 75,
+    `24_catch_5yrs` == "improves_heavily" ~ 100
+  )) %>% 
+  group_by(ma_name) %>%
+  mutate(period = case_when(
+    year == min(year) ~ "before",
+    year == max(year) ~ "after"
+  )) %>%
+  ungroup()
+
+# Calculate average of q24 per site per year
+q24_summary <- q24 %>%
+  group_by(ma_name, year, period) %>%
+  summarise(avg_q24_continuous = mean(q24_continuous, na.rm = TRUE)) %>%
+  ungroup()
+
+
+before_after_avg_q24 <- q24_summary %>%
+  group_by(period) %>%
+  summarise(overall_avg_q24 = mean(avg_q24_continuous, na.rm = TRUE))
+
+
+# Custom function for linear regression with robust standard errors
+q24 <- q24 %>%
+  mutate(period = factor(period, levels = c("before", "after")))
+
+lm_robust <- function(df) {
+  lm(q24_continuous ~ period, data = df) %>%
+    coeftest(vcov = sandwich::vcovHC(., "HC1")) # Robust standard errors (HC1 correction)
+}
+
+# Run the regression for each site and extract the before-after coefficient
+before_after_models_q24 <- q24 %>%
+  group_by(ma_name) %>%
+  do(tidy(lm(q24_continuous ~ period, data = .), conf.int = TRUE)) %>%
+  filter(term == "periodafter")
+
+# Add 95% confidence intervals
+before_after_models_q24 <- before_after_models_q24 %>%
+  mutate(conf.high.95 = estimate + 1.96 * std.error,
+         conf.low.95 = estimate - 1.96 * std.error)
+
+# Plot the effect size (β1) for each site
+before_after_models_q24 <- before_after_models_q24 %>%
+  mutate(
+    significance = case_when(
+      p.value < 0.05 & estimate > 0 ~ "Positive (p < 0.05)",
+      p.value < 0.05 & estimate < 0 ~ "Negative (p < 0.05)",
+      p.value >= 0.05 ~ "Not Significant"
+    ),
+    # Set colors for plotting
+    color = case_when(
+      p.value < 0.05 & estimate > 0 ~ "forestgreen",    
+      p.value < 0.05 & estimate < 0 ~ "purple",         
+      p.value >= 0.05 ~ "white"                       
+    )
+  )
+
+
+before_after_models_q24 %>%
+  ggplot(aes(x = reorder(ma_name, estimate), y = estimate, fill = significance)) +
+  geom_point(shape = 21, size = 3, color = "black") +  
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.2) +
+  scale_fill_manual(values = c("Positive (p < 0.05)" = "forestgreen", 
+                               "Negative (p < 0.05)" = "purple", 
+                               "Not Significant" = "white")) +  
+  coord_flip() +
+  labs(x = "Site", y = "Effect Size (β1)", 
+       title = "Before–after standardized effect sizes for Q24 by Site", #change title
+       fill = "Change") +
+  theme_minimal()
+
+
+```
+
+## Question 25
+
+*Do you believe that the job of a fisher is secure in the future?*
+
+Possible answers:
+
+1.  Yes
+
+2.  No
+
+```{r}
+# Find data
+# colnames(fastfield)[grepl("25", colnames(fastfield))]
+# colnames(kobo_1_fp)[grepl("job_secure'", colnames(kobo_1_fp))]
+# colnames(kobo_2_fp_hon)[grepl("job_secure'", colnames(kobo_2_fp_hon))]
+
+# Select Q25, site, year
+fastfield_q25 <- fastfield %>% 
+  select(ma_name, year, '25_job_secure')
+fastfield_q25$'25_job_secure'<- tolower(gsub(" ", "_", fastfield_q25$'25_job_secure'))
+
+kobo_1_fp_q25 <- kobo_1_fp %>% 
+  select(ma_name, year, '25_job_secure')
+kobo_1_fp_q25$'25_job_secure'<- tolower(gsub(" ", "_", kobo_1_fp_q25$'25_job_secure'))
+
+kobo_2_fp_hon_q25 <- kobo_2_fp_hon %>% 
+  select(ma_name, year, '20_job_secure') # here is the question 19!
+kobo_2_fp_hon_q25$'25_job_secure'<- tolower(gsub(" ", "_", kobo_2_fp_hon_q25$'20_job_secure')) #change column name
+kobo_2_fp_hon_q25 <- kobo_2_fp_hon_q25 %>% 
+  select(ma_name, year, '25_job_secure')
+
+# Check answers
+# Possible answers: 
+# 1. Yes
+# 2. No
+# unique(fastfield_q25$`25_job_secure`)
+# unique(kobo_1_fp_q25$`25_job_secure`)
+# unique(kobo_2_fp_hon_q25$`25_job_secure`)
+
+# Combine datasets
+q25 <- bind_rows(
+  select(fastfield_q25, ma_name, year, `25_job_secure`),
+  select(kobo_1_fp_q25, ma_name, year, `25_job_secure`),
+  select(kobo_2_fp_hon_q25, ma_name, year, `25_job_secure`)
+)
+
+
+# Check different years for each ma_name
+q_25_years_by_site <- q25 %>%
+  group_by(ma_name) %>%
+  summarise(years = list(unique(year)))
+
+# Remove sites with only one hhs (year)
+q25 <- q25 %>%
+  group_by(ma_name) %>%
+  filter(n_distinct(year) > 1) %>%
+  ungroup() 
+
+# Remove answers like "not a fisher", NAs, etc
+answers_q25 <- c("yes", "no")
+q25 <- q25 %>%
+  filter(`25_job_secure` %in% answers_q25)
+
+
+# Create a binary version of the question 25
+q25 <- q25 %>%
+  mutate(q25_binary = case_when(
+    `25_job_secure` == "yes" ~ 100,
+    `25_job_secure` == "no" ~ 0
+  )) %>%
+  group_by(ma_name) %>%
+  mutate(period = case_when(
+    year == min(year) ~ "before",
+    year == max(year) ~ "after"
+  )) %>%
+  ungroup()
+
+
+# Custom function for linear regression with robust standard errors
+q25 <- q25 %>%
+  mutate(period = factor(period, levels = c("before", "after")))
+
+lm_robust_q25 <- function(df) {
+  lm(q25_binary ~ period, data = df) %>%
+    coeftest(vcov = sandwich::vcovHC(., "HC1")) # Robust standard errors (HC1 correction)
+}
+
+# Run the regression for each site and extract the before-after coefficient
+before_after_models_q25 <- q25 %>%
+  group_by(ma_name) %>%
+  do(tidy(lm(q25_binary ~ period, data = .), conf.int = TRUE)) %>%
+  filter(term == "periodafter")
+
+# Add 95% confidence intervals
+before_after_models_q25 <- before_after_models_q25 %>%
+  mutate(conf.high.95 = estimate + 1.96 * std.error,
+         conf.low.95 = estimate - 1.96 * std.error)
+
+# Plot the effect size (β1) for each site
+before_after_models_q25 <- before_after_models_q25 %>%
+  mutate(
+    significance = case_when(
+      p.value < 0.05 & estimate > 0 ~ "Positive (p < 0.05)",
+      p.value < 0.05 & estimate < 0 ~ "Negative (p < 0.05)",
+      p.value >= 0.05 ~ "Not Significant"
+    ),
+    # Set colors for plotting
+    color = case_when(
+      p.value < 0.05 & estimate > 0 ~ "forestgreen",    
+      p.value < 0.05 & estimate < 0 ~ "purple",         
+      p.value >= 0.05 ~ "white"                       
+    )
+  )
+
+# Plot
+before_after_models_q25 %>%
+  ggplot(aes(x = reorder(ma_name, estimate), y = estimate, fill = significance)) +
+  geom_point(shape = 21, size = 3, color = "black") +  
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.2) +
+  scale_fill_manual(values = c("Positive (p < 0.05)" = "forestgreen", 
+                               "Negative (p < 0.05)" = "purple", 
+                               "Not Significant" = "white")) +  
+  coord_flip() +
+  labs(x = "Site", y = "Effect Size (β1)", 
+       title = "Before–after standardized effect sizes for Q25 by Site", #change title
+       fill = "Change") +
+  theme_minimal()
+
+
+# Effect Size (β1): For binary variables like "Yes/No," the effect size (β1) represents the change in the probability of answering "Yes" after the intervention compared to before. For example, if the effect size for a particular site is 20, it means that after the intervention, the probability of answering "Yes" increased by 0.2 (or 20 percentage points).
+```
+
+## Question 53
+
+*Do you think there is any benefit to regulating fishing via a managed access area and a reserve area?*
+
+Possible answers:
+
+1.  Yes
+
+2.  No
+
+```{r}
+# Find data
+# colnames(fastfield)[grepl("ma_benefits", colnames(fastfield))]
+# colnames(kobo_1_fp)[grepl("ma_benefits", colnames(kobo_1_fp))]
+# colnames(kobo_2_fp_hon)[grepl("ma_benefits", colnames(kobo_2_fp_hon))]
+
+# Select Q53, site, year
+
+fastfield_q53 <- fastfield %>% 
+  select(ma_name, year, '53_ma_benefits')
+fastfield_q53$'53_ma_benefits'<- tolower(gsub(" ", "_", fastfield_q53$'53_ma_benefits'))
+
+kobo_1_fp_q53 <- kobo_1_fp %>% 
+  select(ma_name, year, '53_ma_benefits')
+kobo_1_fp_q53$'53_ma_benefits'<- tolower(gsub(" ", "_", kobo_1_fp_q53$'53_ma_benefits'))
+
+# NO question ma_benefits in kobo_2_fp_hon
+# kobo_2_fp_hon_q53 <- kobo_2_fp_hon %>% 
+#   select(ma_name, year, '20_job_secure') # here is the question 19!
+# kobo_2_fp_hon_q53$'25_job_secure'<- tolower(gsub(" ", "_", kobo_2_fp_hon_q53$'20_job_secure')) #change column name
+# kobo_2_fp_hon_q25 <- kobo_2_fp_hon_q25 %>% 
+#   select(ma_name, year, '25_job_secure')
+
+# Check answers
+# Possible answers: 
+# 1. Yes
+# 2. No
+# unique(fastfield_q53$`53_ma_benefits`)
+# unique(kobo_1_fp_q53$`53_ma_benefits`)
+# unique(kobo_2_fp_hon_q25$`25_job_secure`)
+
+# Combine datasets
+q53 <- bind_rows(
+  select(fastfield_q53, ma_name, year, `53_ma_benefits`),
+  select(kobo_1_fp_q53, ma_name, year, `53_ma_benefits`)
+  # select(kobo_2_fp_hon_q25, ma_name, year, `25_job_secure`)
+)
+
+
+# Check different years for each ma_name
+q_53_years_by_site <- q53 %>%
+  group_by(ma_name) %>%
+  summarise(years = list(unique(year)))
+
+# Remove sites with only one hhs (year)
+q53 <- q53 %>%
+  group_by(ma_name) %>%
+  filter(n_distinct(year) > 1) %>%
+  ungroup() 
+
+# Remove answers like "not a fisher", NAs, etc
+answers_q53 <- c("yes", "no")
+q53 <- q53 %>%
+  filter(`53_ma_benefits` %in% answers_q53)
+
+
+# Create a binary version of the question 53
+q53 <- q53 %>%
+  mutate(q53_binary = case_when(
+    `53_ma_benefits` == "yes" ~ 100,
+    `53_ma_benefits` == "no" ~ 0
+  )) %>%
+  group_by(ma_name) %>%
+  mutate(period = case_when(
+    year == min(year) ~ "before",
+    year == max(year) ~ "after"
+  )) %>%
+  ungroup()
+
+
+# Custom function for linear regression with robust standard errors
+q53 <- q53 %>%
+  mutate(period = factor(period, levels = c("before", "after")))
+
+lm_robust_q53 <- function(df) {
+  lm(q53_binary ~ period, data = df) %>%
+    coeftest(vcov = sandwich::vcovHC(., "HC1")) # Robust standard errors (HC1 correction)
+}
+
+# Run the regression for each site and extract the before-after coefficient
+before_after_models_q53 <- q53 %>%
+  group_by(ma_name) %>%
+  do(tidy(lm(q53_binary ~ period, data = .), conf.int = TRUE)) %>%
+  filter(term == "periodafter")
+
+# Add 95% confidence intervals
+before_after_models_q53 <- before_after_models_q53 %>%
+  mutate(conf.high.95 = estimate + 1.96 * std.error,
+         conf.low.95 = estimate - 1.96 * std.error)
+
+# Plot the effect size (β1) for each site
+before_after_models_q53 <- before_after_models_q53 %>%
+  mutate(
+    significance = case_when(
+      p.value < 0.05 & estimate > 0 ~ "Positive (p < 0.05)",
+      p.value < 0.05 & estimate < 0 ~ "Negative (p < 0.05)",
+      p.value >= 0.05 ~ "Not Significant"
+    ),
+    # Set colors for plotting
+    color = case_when(
+      p.value < 0.05 & estimate > 0 ~ "forestgreen",    
+      p.value < 0.05 & estimate < 0 ~ "purple",         
+      p.value >= 0.05 ~ "white"                       
+    )
+  )
+
+# Plot
+before_after_models_q53 %>%
+  ggplot(aes(x = reorder(ma_name, estimate), y = estimate, fill = significance)) +
+  geom_point(shape = 21, size = 3, color = "black") +  
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.2) +
+  scale_fill_manual(values = c("Positive (p < 0.05)" = "forestgreen", 
+                               "Negative (p < 0.05)" = "purple", 
+                               "Not Significant" = "white")) +  
+  coord_flip() +
+  labs(x = "Site", y = "Effect Size (β1)", 
+       title = "Before–after standardized effect sizes for Q53 by Site", #change title
+       fill = "Change") +
+  theme_minimal()
+
+
+# Effect Size (β1): For binary variables like "Yes/No," the effect size (β1) represents the change in the probability of answering "Yes" after the intervention compared to before. For example, if the effect size for a particular site is 0.2, it means that after the intervention, the probability of answering "Yes" increased by 0.2 (or 20 percentage points).
+
+```
+
+## Question 58
+
+*Do you agree that the fisheries management body represents your role in the fishery?*
+
+Possible answers:
+
+1.  Yes
+
+2.  No
+
+```{r}
+# Find data
+# colnames(fastfield)[grepl("58", colnames(fastfield))]
+# colnames(kobo_1_fp)[grepl("represent_role'", colnames(kobo_1_fp))]
+# colnames(kobo_2_fp_hon)[grepl("represent_role'", colnames(kobo_2_fp_hon))]
+
+# Select Q58, site, year
+fastfield_q58 <- fastfield %>% 
+  select(ma_name, year, '58_represent_role')
+fastfield_q58$'58_represent_role'<- tolower(gsub(" ", "_", fastfield_q58$'58_represent_role'))
+
+kobo_1_fp_q58 <- kobo_1_fp %>% 
+  select(ma_name, year, '58_represent_role')
+kobo_1_fp_q58$'58_represent_role'<- tolower(gsub(" ", "_", kobo_1_fp_q58$'58_represent_role'))
+
+# NO question ma_benefits in kobo_2_fp_hon
+# kobo_2_fp_hon_q53 <- kobo_2_fp_hon %>% 
+#   select(ma_name, year, '20_job_secure') # here is the question 19!
+# kobo_2_fp_hon_q53$'25_job_secure'<- tolower(gsub(" ", "_", kobo_2_fp_hon_q53$'20_job_secure')) #change column name
+# kobo_2_fp_hon_q25 <- kobo_2_fp_hon_q25 %>% 
+#   select(ma_name, year, '25_job_secure')
+
+# Check answers
+# Possible answers: 
+# 1. Yes
+# 2. No
+# unique(fastfield_q58$`58_represent_role`)
+# unique(kobo_1_fp_q58$`58_represent_role`)
+# unique(kobo_2_fp_hon_q25$`25_job_secure`)
+
+# Combine datasets
+q58 <- bind_rows(
+  select(fastfield_q58, ma_name, year, `58_represent_role`),
+  select(kobo_1_fp_q58, ma_name, year, `58_represent_role`)
+  # select(kobo_2_fp_hon_q25, ma_name, year, `25_job_secure`)
+)
+
+
+
+
+# Remove answers like "not a fisher", NAs, etc
+answers_q58 <- c("agree", "disagree", "neither")
+q58 <- q58 %>%
+  filter(`58_represent_role` %in% answers_q58) #from 11k to just 5k observations!!
+
+# Create a continuous version of the question 58
+q58 <- q58 %>%
+  mutate(q58_continuous = case_when(
+    `58_represent_role` == "disagree" ~ 0,
+    `58_represent_role` == "neither" ~ 50,
+    `58_represent_role` == "agree" ~ 100
+  )) %>%
+  group_by(ma_name) %>%
+  mutate(period = case_when(
+    year == min(year) ~ "before",  
+    year == max(year) ~ "after"    
+  )) %>%
+  ungroup()
+
+# Check different years for each ma_name
+q_58_years_by_site <- q58 %>%
+  group_by(ma_name) %>%
+  summarise(years = list(unique(year)))
+
+# Remove sites with only one hhs (year)
+q58 <- q58 %>%
+  group_by(ma_name) %>%
+  filter(n_distinct(year) > 1) %>%
+  ungroup() 
+
+
+# Custom function for linear regression with robust standard errors
+q58 <- q58 %>%
+  mutate(period = factor(period, levels = c("before", "after")))
+
+# Define the robust linear model function
+lm_robust_q58 <- function(df) {
+  lm(q58_continuous ~ period, data = df) %>%
+    coeftest(vcov = sandwich::vcovHC(., "HC1"))  # Use robust standard errors (HC1 correction)
+}
+
+# Run the regression for each site and extract the before-after coefficient
+before_after_models_q58 <- q58 %>%
+  group_by(ma_name) %>%
+  do(tidy(lm_robust_q58(.), conf.int = TRUE)) %>%
+  filter(term == "periodafter")  # Only keep the coefficient for the 'after' period
+
+# Add 95% confidence intervals
+before_after_models_q58 <- before_after_models_q58 %>%
+  mutate(conf.high.95 = estimate + 1.96 * std.error,
+         conf.low.95 = estimate - 1.96 * std.error)
+
+
+before_after_models_q58 <- before_after_models_q58 %>%
+  mutate(
+    significance = case_when(
+      p.value < 0.05 & estimate > 0 ~ "Positive (p < 0.05)",
+      p.value < 0.05 & estimate < 0 ~ "Negative (p < 0.05)",
+      p.value >= 0.05 ~ "Not Significant"
+    ),
+    color = case_when(
+      p.value < 0.05 & estimate > 0 ~ "forestgreen",    # Positive significant
+      p.value < 0.05 & estimate < 0 ~ "purple",         # Negative significant
+      p.value >= 0.05 ~ "white"                        # Not significant
+    )
+  )
+
+# Create the plot
+before_after_models_q58 %>%
+  ggplot(aes(x = reorder(ma_name, estimate), y = estimate, fill = significance)) +
+  geom_point(shape = 21, size = 3, color = "black") +  # Shape 21 allows filling with color
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.2) +
+  scale_fill_manual(values = c("Positive (p < 0.05)" = "forestgreen", 
+                               "Negative (p < 0.05)" = "purple", 
+                               "Not Significant" = "white")) +  
+  coord_flip() +
+  labs(x = "Site", y = "Effect Size (β1)", 
+       title = "Before–after standardized effect sizes for Q58 by Site", 
+       fill = "Change") +
+  theme_minimal()
+
+
+# The effect size (β1) reflects the average shift in agreement (on the 0-1 scale) between the before and after periods.
+
+```
+
+## Question 61
+
+*How strong do you feel that your opinions/concerns are considered during management body decision-making processes?*
+
+Possible answers:
+
+1.  Very low
+
+2.  Low
+
+3.  Neither strong or low
+
+4.  Strong
+
+5.  Very strong
+
+6.  No management body
+
+```{r}
+# Find data
+# colnames(fastfield)[grepl("61", colnames(fastfield))]
+# colnames(kobo_1_fp)[grepl("opinions_considered", colnames(kobo_1_fp))]
+# colnames(kobo_2_fp_hon)[grepl("opinions_considered", colnames(kobo_2_fp_hon))]
+
+# Select Q24, site, year
+fastfield_q61 <- fastfield %>% 
+  select(ma_name, year, '61_opinions_considered')
+fastfield_q61$'61_opinions_considered'<- tolower(gsub(" ", "_", fastfield_q61$'61_opinions_considered'))
+
+kobo_1_fp_q61 <- kobo_1_fp %>% 
+  select(ma_name, year, '61_opinions_considered')
+kobo_1_fp_q61$'61_opinions_considered'<- tolower(gsub(" ", "_", kobo_1_fp_q61$'61_opinions_considered'))
+
+kobo_2_fp_hon_q61 <- kobo_2_fp_hon %>% 
+  select(ma_name, year, '41_opinions_considered') # here is the question 19!
+kobo_2_fp_hon_q61$'61_opinions_considered'<- tolower(gsub(" ", "_", kobo_2_fp_hon_q61$'41_opinions_considered')) #change column name
+kobo_2_fp_hon_q61 <- kobo_2_fp_hon_q61 %>% 
+  select(ma_name, year, '61_opinions_considered')
+
+# Check answers
+# Possible answers: 
+# 1. Very low
+# 2. Low
+# 3. Neither strong or low
+# 4. Strong
+# 5. Very strong
+# 6. No management body --> remove these
+# unique(fastfield_q61$`61_opinions_considered`)
+# unique(kobo_1_fp_q61$`61_opinions_considered`)
+# unique(kobo_2_fp_hon_q61$`61_opinions_considered`)
+
+# Replace "declined_alot" with "declined_a_lot"
+fastfield_q61$`61_opinions_considered` <- gsub("neither_strong_or_low", "neither", fastfield_q61$`61_opinions_considered`)
+ 
+# Combine datasets
+q61 <- bind_rows(
+  select(fastfield_q61, ma_name, year, `61_opinions_considered`),
+  select(kobo_1_fp_q61, ma_name, year, `61_opinions_considered`),
+  select(kobo_2_fp_hon_q61, ma_name, year, `61_opinions_considered`)
+)
+
+
+# Remove answers like "not a fisher", NAs, etc
+answers_q61 <- c("very_low", "low", "neither", "strong", "very_strong")
+q61 <- q61 %>%
+  filter(`61_opinions_considered` %in% answers_q61)
+
+# Check different years for each ma_name
+q_61_years_by_site <- q61 %>%
+  group_by(ma_name) %>%
+  summarise(years = list(unique(year)))
+
+# Remove sites with only one hhs (year)
+q61 <- q61 %>%
+  group_by(ma_name) %>%
+  filter(n_distinct(year) > 1) %>%
+  ungroup() 
+
+# Ordinal to continuous mapping (answers in a continuos scale 0-100)
+q61 <- q61 %>%
+  mutate(q61_continuous = case_when(
+    `61_opinions_considered` == "very_low" ~ 0,
+    `61_opinions_considered` == "low" ~ 25,
+    `61_opinions_considered` == "neither" ~ 50,
+    `61_opinions_considered` == "strong" ~ 75,
+    `61_opinions_considered` == "very_strong" ~ 100
+  )) %>% 
+  group_by(ma_name) %>%
+  mutate(period = case_when(
+    year == min(year) ~ "before",
+    year == max(year) ~ "after"
+  )) %>%
+  ungroup()
+
+# Calculate average of q24 per site per year
+q61_summary <- q61 %>%
+  group_by(ma_name, year, period) %>%
+  summarise(avg_q61_continuous = mean(q61_continuous, na.rm = TRUE)) %>%
+  ungroup()
+
+
+before_after_avg_q61 <- q61_summary %>%
+  group_by(period) %>%
+  summarise(overall_avg_q61 = mean(avg_q61_continuous, na.rm = TRUE))
+
+
+# Custom function for linear regression with robust standard errors
+q61 <- q61 %>%
+  mutate(period = factor(period, levels = c("before", "after")))
+
+lm_robust <- function(df) {
+  lm(q61_continuous ~ period, data = df) %>%
+    coeftest(vcov = sandwich::vcovHC(., "HC1")) # Robust standard errors (HC1 correction)
+}
+
+# Run the regression for each site and extract the before-after coefficient
+before_after_models_q61 <- q61 %>%
+  group_by(ma_name) %>%
+  do(tidy(lm(q61_continuous ~ period, data = .), conf.int = TRUE)) %>%
+  filter(term == "periodafter")
+
+# Add 95% confidence intervals
+before_after_models_q61 <- before_after_models_q61 %>%
+  mutate(conf.high.95 = estimate + 1.96 * std.error,
+         conf.low.95 = estimate - 1.96 * std.error)
+
+# Plot the effect size (β1) for each site
+before_after_models_q61 <- before_after_models_q61 %>%
+  mutate(
+    significance = case_when(
+      p.value < 0.05 & estimate > 0 ~ "Positive (p < 0.05)",
+      p.value < 0.05 & estimate < 0 ~ "Negative (p < 0.05)",
+      p.value >= 0.05 ~ "Not Significant"
+    ),
+    # Set colors for plotting
+    color = case_when(
+      p.value < 0.05 & estimate > 0 ~ "forestgreen",    
+      p.value < 0.05 & estimate < 0 ~ "purple",         
+      p.value >= 0.05 ~ "white"                       
+    )
+  )
+
+
+before_after_models_q61 %>%
+  ggplot(aes(x = reorder(ma_name, estimate), y = estimate, fill = significance)) +
+  geom_point(shape = 21, size = 3, color = "black") +  
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.2) +
+  scale_fill_manual(values = c("Positive (p < 0.05)" = "forestgreen", 
+                               "Negative (p < 0.05)" = "purple", 
+                               "Not Significant" = "white")) +  
+  coord_flip() +
+  labs(x = "Site", y = "Effect Size (β1)", 
+       title = "Before–after standardized effect sizes for Q61 by Site", #change title
+       fill = "Change") +
+  theme_minimal()
+
+
+
+```
+
+## Question 66
+
+*Do you think the fisheries management/managed access and reserve approach will benefit the community over the next five years?*
+
+Possible answers:
+
+1.  Yes
+
+2.  Unsure
+
+3.  No
+
+4.  Community does not have a fisheries management system
+
+```{r}
+# Find data
+# colnames(fastfield)[grepl("66", colnames(fastfield))]
+# colnames(kobo_1_fp)[grepl("ma_benefit_5yrs", colnames(kobo_1_fp))]
+# colnames(kobo_2_fp_hon)[grepl("ma_benefit_5yrs", colnames(kobo_2_fp_hon))]
+
+# Select Q58, site, year
+fastfield_q66 <- fastfield %>% 
+  select(ma_name, year, '66_ma_benefit_5yrs')
+fastfield_q66$'66_ma_benefit_5yrs'<- tolower(gsub(" ", "_", fastfield_q66$'66_ma_benefit_5yrs'))
+
+kobo_1_fp_q66 <- kobo_1_fp %>% 
+  select(ma_name, year, '66_ma_benefit_5yrs')
+kobo_1_fp_q66$'66_ma_benefit_5yrs'<- tolower(gsub(" ", "_", kobo_1_fp_q66$'66_ma_benefit_5yrs'))
+
+kobo_2_fp_hon_q66 <- kobo_2_fp_hon %>%
+  select(ma_name, year, '43_ma_benefit_5yrs') # here is the question 19!
+kobo_2_fp_hon_q66$'66_ma_benefit_5yrs'<- tolower(gsub(" ", "_", kobo_2_fp_hon_q66$'43_ma_benefit_5yrs')) #change column name
+kobo_2_fp_hon_q66 <- kobo_2_fp_hon_q66 %>%
+  select(ma_name, year, '66_ma_benefit_5yrs')
+
+# Check answers
+# Possible answers:
+# 1. Yes
+# 2. Unsure
+# 3. No
+# 4. Community does not have a fisheries management system
+unique(fastfield_q66$`66_ma_benefit_5yrs`)
+unique(kobo_1_fp_q66$`66_ma_benefit_5yrs`)
+unique(kobo_2_fp_hon_q66$`66_ma_benefit_5yrs`)
+
+# Combine datasets
+q66 <- bind_rows(
+  select(fastfield_q66, ma_name, year, `66_ma_benefit_5yrs`),
+  select(kobo_1_fp_q66, ma_name, year, `66_ma_benefit_5yrs`),
+  select(kobo_2_fp_hon_q66, ma_name, year, `66_ma_benefit_5yrs`)
+)
+
+
+# Remove answers like "not a fisher", NAs, etc
+answers_q66 <- c("yes", "no", "unsure")
+q66 <- q66 %>%
+  filter(`66_ma_benefit_5yrs` %in% answers_q66) 
+
+# Create a continuous version of the question 58
+q66 <- q66 %>%
+  mutate(q66_continuous = case_when(
+    `66_ma_benefit_5yrs` == "no" ~ 0,
+    `66_ma_benefit_5yrs` == "unsure" ~ 50,
+    `66_ma_benefit_5yrs` == "yes" ~ 100
+  )) %>%
+  group_by(ma_name) %>%
+  mutate(period = case_when(
+    year == min(year) ~ "before",  
+    year == max(year) ~ "after"    
+  )) %>%
+  ungroup()
+
+# Check different years for each ma_name
+q_66_years_by_site <- q66 %>%
+  group_by(ma_name) %>%
+  summarise(years = list(unique(year)))
+
+# Remove sites with only one hhs (year)
+q66 <- q66 %>%
+  group_by(ma_name) %>%
+  filter(n_distinct(year) > 1) %>%
+  ungroup() 
+
+
+# Custom function for linear regression with robust standard errors
+q66 <- q66 %>%
+  mutate(period = factor(period, levels = c("before", "after")))
+
+# Define the robust linear model function
+lm_robust_q66 <- function(df) {
+  lm(q66_continuous ~ period, data = df) %>%
+    coeftest(vcov = sandwich::vcovHC(., "HC1"))  # Use robust standard errors (HC1 correction)
+}
+
+# Run the regression for each site and extract the before-after coefficient
+before_after_models_q66 <- q66 %>%
+  group_by(ma_name) %>%
+  do(tidy(lm_robust_q66(.), conf.int = TRUE)) %>%
+  filter(term == "periodafter")  # Only keep the coefficient for the 'after' period
+
+# Add 95% confidence intervals
+before_after_models_q66 <- before_after_models_q66 %>%
+  mutate(conf.high.95 = estimate + 1.96 * std.error,
+         conf.low.95 = estimate - 1.96 * std.error)
+
+
+before_after_models_q66 <- before_after_models_q66 %>%
+  mutate(
+    significance = case_when(
+      p.value < 0.05 & estimate > 0 ~ "Positive (p < 0.05)",
+      p.value < 0.05 & estimate < 0 ~ "Negative (p < 0.05)",
+      p.value >= 0.05 ~ "Not Significant"
+    ),
+    color = case_when(
+      p.value < 0.05 & estimate > 0 ~ "forestgreen",    # Positive significant
+      p.value < 0.05 & estimate < 0 ~ "purple",         # Negative significant
+      p.value >= 0.05 ~ "white"                        # Not significant
+    )
+  )
+
+# Create the plot
+before_after_models_q66 %>%
+  ggplot(aes(x = reorder(ma_name, estimate), y = estimate, fill = significance)) +
+  geom_point(shape = 21, size = 3, color = "black") +  # Shape 21 allows filling with color
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.2) +
+  scale_fill_manual(values = c("Positive (p < 0.05)" = "forestgreen", 
+                               "Negative (p < 0.05)" = "purple", 
+                               "Not Significant" = "white")) +  
+  coord_flip() +
+  labs(x = "Site", y = "Effect Size (β1)", 
+       title = "Before–after standardized effect sizes for Q66 by Site", 
+       fill = "Change") +
+  theme_minimal()
+
+
+# The effect size (β1) reflects the average shift in agreement (on the 0-1 scale) between the before and after periods.
+
+```
+
+## Question 72
+
+*Are you confident that you will be able to procure enough food for you and your family for the next 12 months?*
+
+Possible answers:
+
+1.  Certain to have shortage
+
+2.  High chance of having shortage
+
+3.  Uncertain
+
+4.  Confident to procure enough food
+
+5.  Very confident to procure enough food
+
+```{r}
+# Find data
+# colnames(fastfield)[grepl("72", colnames(fastfield))]
+# colnames(kobo_1_fp)[grepl("food_procurement", colnames(kobo_1_fp))]
+# colnames(kobo_2_fp_hon)[grepl("food_procurement", colnames(kobo_2_fp_hon))]
+
+
+# Select Q24, site, year
+fastfield_q72 <- fastfield %>% 
+  select(ma_name, year, '72_food_procurement')
+fastfield_q72$'72_food_procurement'<- tolower(gsub(" ", "_", fastfield_q72$'72_food_procurement'))
+
+kobo_1_fp_q72 <- kobo_1_fp %>% 
+  select(ma_name, year, '72_food_procurement')
+kobo_1_fp_q72$'72_food_procurement'<- tolower(gsub(" ", "_", kobo_1_fp_q72$'72_food_procurement'))
+
+kobo_2_fp_hon_q72 <- kobo_2_fp_hon %>% 
+  select(ma_name, year, '50_food_procurement') # here is the question 19!
+kobo_2_fp_hon_q72$'72_food_procurement'<- tolower(gsub(" ", "_", kobo_2_fp_hon_q72$'50_food_procurement')) #change column name
+kobo_2_fp_hon_q72 <- kobo_2_fp_hon_q72 %>% 
+  select(ma_name, year, '72_food_procurement')
+
+# Check answers
+# Possible answers:
+# 1. Certain to have shortage
+# 2. High chance of having shortage
+# 3. Uncertain
+# 4. Confident to procure enough food
+# 5. Very confident to procure enough food
+# unique(fastfield_q72$`72_food_procurement`)
+# unique(kobo_1_fp_q72$`72_food_procurement`)
+# unique(kobo_2_fp_hon_q72$`72_food_procurement`)
+
+# Combine datasets
+q72 <- bind_rows(
+  select(fastfield_q72, ma_name, year, `72_food_procurement`),
+  select(kobo_1_fp_q72, ma_name, year, `72_food_procurement`),
+  select(kobo_2_fp_hon_q72, ma_name, year, `72_food_procurement`)
+)
+
+
+# Remove answers like "not a fisher", NAs, etc
+answers_q72 <- c("certain", "high_chance", "uncertain", "confident_not", "very_confident_not")
+q72 <- q72 %>%
+  filter(`72_food_procurement` %in% answers_q72)
+
+# Check different years for each ma_name
+q_72_years_by_site <- q72 %>%
+  group_by(ma_name) %>%
+  summarise(years = list(unique(year)))
+
+# Remove sites with only one hhs (year)
+q72 <- q72 %>%
+  group_by(ma_name) %>%
+  filter(n_distinct(year) > 1) %>%
+  ungroup() 
+
+# Ordinal to continuous mapping (answers in a continuos scale 0-100)
+q72 <- q72 %>%
+  mutate(q72_continuous = case_when(
+    `72_food_procurement` == "certain" ~ 0,
+    `72_food_procurement` == "high_chance" ~ 25,
+    `72_food_procurement` == "uncertain" ~ 50,
+    `72_food_procurement` == "confident_not" ~ 75,
+    `72_food_procurement` == "very_confident_not" ~ 100
+  )) %>% 
+  group_by(ma_name) %>%
+  mutate(period = case_when(
+    year == min(year) ~ "before",
+    year == max(year) ~ "after"
+  )) %>%
+  ungroup()
+
+# Calculate average of q24 per site per year
+q72_summary <- q72 %>%
+  group_by(ma_name, year, period) %>%
+  summarise(avg_q72_continuous = mean(q72_continuous, na.rm = TRUE)) %>%
+  ungroup()
+
+
+before_after_avg_q72 <- q72_summary %>%
+  group_by(period) %>%
+  summarise(overall_avg_q72 = mean(avg_q72_continuous, na.rm = TRUE))
+
+
+# Custom function for linear regression with robust standard errors
+q72 <- q72 %>%
+  mutate(period = factor(period, levels = c("before", "after")))
+
+lm_robust <- function(df) {
+  lm(q72_continuous ~ period, data = df) %>%
+    coeftest(vcov = sandwich::vcovHC(., "HC1")) # Robust standard errors (HC1 correction)
+}
+
+# Run the regression for each site and extract the before-after coefficient
+before_after_models_q72 <- q72 %>%
+  group_by(ma_name) %>%
+  do(tidy(lm(q72_continuous ~ period, data = .), conf.int = TRUE)) %>%
+  filter(term == "periodafter")
+
+# Add 95% confidence intervals
+before_after_models_q72 <- before_after_models_q72 %>%
+  mutate(conf.high.95 = estimate + 1.96 * std.error,
+         conf.low.95 = estimate - 1.96 * std.error)
+
+# Plot the effect size (β1) for each site
+before_after_models_q72 <- before_after_models_q72 %>%
+  mutate(
+    significance = case_when(
+      p.value < 0.05 & estimate > 0 ~ "Positive (p < 0.05)",
+      p.value < 0.05 & estimate < 0 ~ "Negative (p < 0.05)",
+      p.value >= 0.05 ~ "Not Significant"
+    ),
+    # Set colors for plotting
+    color = case_when(
+      p.value < 0.05 & estimate > 0 ~ "forestgreen",    
+      p.value < 0.05 & estimate < 0 ~ "purple",         
+      p.value >= 0.05 ~ "white"                       
+    )
+  )
+
+
+before_after_models_q72 %>%
+  ggplot(aes(x = reorder(ma_name, estimate), y = estimate, fill = significance)) +
+  geom_point(shape = 21, size = 3, color = "black") +  
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.2) +
+  scale_fill_manual(values = c("Positive (p < 0.05)" = "forestgreen", 
+                               "Negative (p < 0.05)" = "purple", 
+                               "Not Significant" = "white")) +  
+  coord_flip() +
+  labs(x = "Site", y = "Effect Size (β1)", 
+       title = "Before–after standardized effect sizes for Q72 by Site", #change title
+       fill = "Change") +
+  theme_minimal()
+
+```
+
+## Question 73
+
+In the last 12 months, how often did your household eat fish?
+
+Possible answers:
+
+1.  Once or never
+
+2.  A few times
+
+3.  A few times per months
+
+4.  A few times per week
+
+5.  More than a few times per week
+
+```{r}
+# Find data
+# colnames(fastfield)[grepl("73", colnames(fastfield))]
+# colnames(kobo_1_fp)[grepl("fish_consumption", colnames(kobo_1_fp))]
+# colnames(kobo_2_fp_hon)[grepl("fish_consumption", colnames(kobo_2_fp_hon))]
+
+# Select Q24, site, year
+fastfield_q73 <- fastfield %>% 
+  select(ma_name, year, '73_hh_fish_consumption')
+fastfield_q73$'73_hh_fish_consumption'<- tolower(gsub(" ", "_", fastfield_q73$'73_hh_fish_consumption'))
+
+kobo_1_fp_q73 <- kobo_1_fp %>% 
+  select(ma_name, year, '73_hh_fish_consumption')
+kobo_1_fp_q73$'73_hh_fish_consumption'<- tolower(gsub(" ", "_", kobo_1_fp_q73$'73_hh_fish_consumption'))
+
+kobo_2_fp_hon_q73 <- kobo_2_fp_hon %>% 
+  select(ma_name, year, '51_hh_fish_consumption') # here is the question 19!
+kobo_2_fp_hon_q73$'73_hh_fish_consumption'<- tolower(gsub(" ", "_", kobo_2_fp_hon_q73$'51_hh_fish_consumption')) #change column name
+kobo_2_fp_hon_q73 <- kobo_2_fp_hon_q73 %>% 
+  select(ma_name, year, '73_hh_fish_consumption')
+
+# Check answers
+# Possible answers:
+# 1. Once or never
+# 2. A few times
+# 3. A few times per months
+# 4. A few times per week
+# 5. More than a few times per week
+# unique(fastfield_q73$`73_hh_fish_consumption`)
+# unique(kobo_1_fp_q73$`73_hh_fish_consumption`)
+# unique(kobo_2_fp_hon_q73$`73_hh_fish_consumption`)
+
+# Replace "declined_alot" with "declined_a_lot"
+kobo_1_fp_q73$`73_hh_fish_consumption` <- gsub("more_than_few_times", "more_than_few_per_week", kobo_1_fp_q73$`73_hh_fish_consumption`)
+kobo_1_fp_q73$`73_hh_fish_consumption` <- gsub("few_times_per_week", "few_per_week", kobo_1_fp_q73$`73_hh_fish_consumption`)
+kobo_1_fp_q73$`73_hh_fish_consumption` <- gsub("few_times", "few", kobo_1_fp_q73$`73_hh_fish_consumption`)
+kobo_1_fp_q73$`73_hh_fish_consumption` <- gsub("few_times_per_month", "few_per_month", kobo_1_fp_q73$`73_hh_fish_consumption`)
+
+kobo_2_fp_hon_q73$`73_hh_fish_consumption` <- gsub("more_than_few_times", "more_than_few_per_week", kobo_2_fp_hon_q73$`73_hh_fish_consumption`)
+kobo_2_fp_hon_q73$`73_hh_fish_consumption` <- gsub("few_times_per_week", "few_per_week", kobo_2_fp_hon_q73$`73_hh_fish_consumption`)
+kobo_2_fp_hon_q73$`73_hh_fish_consumption` <- gsub("few_times", "few", kobo_2_fp_hon_q73$`73_hh_fish_consumption`)
+kobo_2_fp_hon_q73$`73_hh_fish_consumption` <- gsub("few_times_per_month", "few_per_month", kobo_2_fp_hon_q73$`73_hh_fish_consumption`)
+
+ 
+# Combine datasets
+q73 <- bind_rows(
+  select(fastfield_q73, ma_name, year, `73_hh_fish_consumption`),
+  select(kobo_1_fp_q73, ma_name, year, `73_hh_fish_consumption`),
+  select(kobo_2_fp_hon_q73, ma_name, year, `73_hh_fish_consumption`)
+)
+
+
+# Remove answers like "not a fisher", NAs, etc
+answers_q73 <- c("once_or_never", "few", "few_per_month", "few_per_week", "more_than_few_per_week")
+q73 <- q73 %>%
+  filter(`73_hh_fish_consumption` %in% answers_q73)
+
+# Check different years for each ma_name
+q_73_years_by_site <- q73 %>%
+  group_by(ma_name) %>%
+  summarise(years = list(unique(year)))
+
+# Remove sites with only one hhs (year)
+q73 <- q73 %>%
+  group_by(ma_name) %>%
+  filter(n_distinct(year) > 1) %>%
+  ungroup() 
+
+# Ordinal to continuous mapping (answers in a continuos scale 0-100)
+q73 <- q73 %>%
+  mutate(q73_continuous = case_when(
+    `73_hh_fish_consumption` == "once_or_never" ~ 0,
+    `73_hh_fish_consumption` == "few" ~ 25,
+    `73_hh_fish_consumption` == "few_per_month" ~ 50,
+    `73_hh_fish_consumption` == "few_per_week" ~ 75,
+    `73_hh_fish_consumption` == "more_than_few_per_week" ~ 100
+  )) %>% 
+  group_by(ma_name) %>%
+  mutate(period = case_when(
+    year == min(year) ~ "before",
+    year == max(year) ~ "after"
+  )) %>%
+  ungroup()
+
+# Calculate average of q24 per site per year
+q73_summary <- q73 %>%
+  group_by(ma_name, year, period) %>%
+  summarise(avg_q73_continuous = mean(q73_continuous, na.rm = TRUE)) %>%
+  ungroup()
+
+
+before_after_avg_q73 <- q73_summary %>%
+  group_by(period) %>%
+  summarise(overall_avg_q73 = mean(avg_q73_continuous, na.rm = TRUE))
+
+
+# Custom function for linear regression with robust standard errors
+q73 <- q73 %>%
+  mutate(period = factor(period, levels = c("before", "after")))
+
+lm_robust <- function(df) {
+  lm(q73_continuous ~ period, data = df) %>%
+    coeftest(vcov = sandwich::vcovHC(., "HC1")) # Robust standard errors (HC1 correction)
+}
+
+# Run the regression for each site and extract the before-after coefficient
+before_after_models_q73 <- q73 %>%
+  group_by(ma_name) %>%
+  do(tidy(lm(q73_continuous ~ period, data = .), conf.int = TRUE)) %>%
+  filter(term == "periodafter")
+
+# Add 95% confidence intervals
+before_after_models_q73 <- before_after_models_q73 %>%
+  mutate(conf.high.95 = estimate + 1.96 * std.error,
+         conf.low.95 = estimate - 1.96 * std.error)
+
+# Plot the effect size (β1) for each site
+before_after_models_q73 <- before_after_models_q73 %>%
+  mutate(
+    significance = case_when(
+      p.value < 0.05 & estimate > 0 ~ "Positive (p < 0.05)",
+      p.value < 0.05 & estimate < 0 ~ "Negative (p < 0.05)",
+      p.value >= 0.05 ~ "Not Significant"
+    ),
+    # Set colors for plotting
+    color = case_when(
+      p.value < 0.05 & estimate > 0 ~ "forestgreen",    
+      p.value < 0.05 & estimate < 0 ~ "purple",         
+      p.value >= 0.05 ~ "white"                       
+    )
+  )
+
+
+before_after_models_q73 %>%
+  ggplot(aes(x = reorder(ma_name, estimate), y = estimate, fill = significance)) +
+  geom_point(shape = 21, size = 3, color = "black") +  
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.2) +
+  scale_fill_manual(values = c("Positive (p < 0.05)" = "forestgreen", 
+                               "Negative (p < 0.05)" = "purple", 
+                               "Not Significant" = "white")) +  
+  coord_flip() +
+  labs(x = "Site", y = "Effect Size (β1)", 
+       title = "Before–after standardized effect sizes for Q73 by Site", #change title
+       fill = "Change") +
+  theme_minimal()
+
+
+
+```
+
+## Question 85
+
+*How do you judge the value of your catch compared to two years ago?*
+
+Possible answers:
+
+1.  Much worse
+
+2.  Slightly worse
+
+3.  Neither better or worse
+
+4.  Slightly better
+
+5.  Much better
+
+```{r}
+# Find data
+# colnames(fastfield)[grepl("85", colnames(fastfield))]
+# colnames(kobo_1_fp)[grepl("current_economic", colnames(kobo_1_fp))]
+# colnames(kobo_2_fp_hon)[grepl("current_economic", colnames(kobo_2_fp_hon))] # No q85
+
+# Select Q24, site, year
+fastfield_q85 <- fastfield %>% 
+  select(ma_name, year, '85_current_economic')
+fastfield_q85$'85_current_economic'<- tolower(gsub(" ", "_", fastfield_q85$'85_current_economic'))
+
+kobo_1_fp_q85 <- kobo_1_fp %>% 
+  select(ma_name, year, '85_current_economic')
+kobo_1_fp_q85$'85_current_economic'<- tolower(gsub(" ", "_", kobo_1_fp_q85$'85_current_economic'))
+
+# kobo_2_fp_hon_q90 <- kobo_2_fp_hon %>% 
+#   select(ma_name, year, '61_hh_ends_meet') # here is the question 19!
+# kobo_2_fp_hon_q90$'90_hh_ends_meet'<- tolower(gsub(" ", "_", kobo_2_fp_hon_q90$'61_hh_ends_meet')) #change column name
+# kobo_2_fp_hon_q90 <- kobo_2_fp_hon_q90 %>% 
+#   select(ma_name, year, '90_hh_ends_meet')
+
+# Check answers
+# Possible answers:
+# 1. Much worse
+# 2. Slightly worse
+# 3. Neither better or worse
+# 4. Slightly better
+# 5. Much better
+# unique(fastfield_q85$`85_current_economic`)
+# unique(kobo_1_fp_q85$`85_current_economic`)
+ 
+# Combine datasets
+q85 <- bind_rows(
+  select(fastfield_q85, ma_name, year, `85_current_economic`),
+  select(kobo_1_fp_q85, ma_name, year, `85_current_economic`))
+
+
+# Remove answers like "not a fisher", NAs, etc
+answers_q85 <- c("much_worse", "slightly_worse", "neither", "slightly_better", "much_better")
+q85 <- q85 %>%
+  filter(`85_current_economic` %in% answers_q85)
+
+# Check different years for each ma_name
+q_85_years_by_site <- q85 %>%
+  group_by(ma_name) %>%
+  summarise(years = list(unique(year)))
+
+# Remove sites with only one hhs (year)
+q85 <- q85 %>%
+  group_by(ma_name) %>%
+  filter(n_distinct(year) > 1) %>%
+  ungroup() 
+
+# Ordinal to continuous mapping (answers in a continuos scale 0-100)
+q85 <- q85 %>%
+  mutate(q85_continuous = case_when(
+    `85_current_economic` == "much_worse" ~ 0,
+    `85_current_economic` == "slightly_worse" ~ 25,
+    `85_current_economic` == "neither" ~ 50,
+    `85_current_economic` == "slightly_better" ~ 75,
+    `85_current_economic` == "much_better" ~ 100
+  )) %>% 
+  group_by(ma_name) %>%
+  mutate(period = case_when(
+    year == min(year) ~ "before",
+    year == max(year) ~ "after"
+  )) %>%
+  ungroup()
+
+# Calculate average of q24 per site per year
+q85_summary <- q85 %>%
+  group_by(ma_name, year, period) %>%
+  summarise(avg_q85_continuous = mean(q85_continuous, na.rm = TRUE)) %>%
+  ungroup()
+
+
+before_after_avg_q85 <- q85_summary %>%
+  group_by(period) %>%
+  summarise(overall_avg_q85 = mean(avg_q85_continuous, na.rm = TRUE))
+
+
+# Custom function for linear regression with robust standard errors
+q85 <- q85 %>%
+  mutate(period = factor(period, levels = c("before", "after")))
+
+lm_robust <- function(df) {
+  lm(q85_continuous ~ period, data = df) %>%
+    coeftest(vcov = sandwich::vcovHC(., "HC1")) # Robust standard errors (HC1 correction)
+}
+
+# Run the regression for each site and extract the before-after coefficient
+before_after_models_q85 <- q85 %>%
+  group_by(ma_name) %>%
+  do(tidy(lm(q85_continuous ~ period, data = .), conf.int = TRUE)) %>%
+  filter(term == "periodafter")
+
+# Add 95% confidence intervals
+before_after_models_q85 <- before_after_models_q85 %>%
+  mutate(conf.high.95 = estimate + 1.96 * std.error,
+         conf.low.95 = estimate - 1.96 * std.error)
+
+# Plot the effect size (β1) for each site
+before_after_models_q85 <- before_after_models_q85 %>%
+  mutate(
+    significance = case_when(
+      p.value < 0.05 & estimate > 0 ~ "Positive (p < 0.05)",
+      p.value < 0.05 & estimate < 0 ~ "Negative (p < 0.05)",
+      p.value >= 0.05 ~ "Not Significant"
+    ),
+    # Set colors for plotting
+    color = case_when(
+      p.value < 0.05 & estimate > 0 ~ "forestgreen",    
+      p.value < 0.05 & estimate < 0 ~ "purple",         
+      p.value >= 0.05 ~ "white"                       
+    )
+  )
+
+before_after_models_q85 %>%
+  ggplot(aes(x = reorder(ma_name, estimate), y = estimate, fill = significance)) +
+  geom_point(shape = 21, size = 3, color = "black") +  
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.2) +
+  scale_fill_manual(values = c("Positive (p < 0.05)" = "forestgreen", 
+                               "Negative (p < 0.05)" = "purple", 
+                               "Not Significant" = "white")) +  
+  coord_flip() +
+  labs(x = "Site", y = "Effect Size (β1)", 
+       title = "Before–after standardized effect sizes for Q85 by Site", #change title
+       fill = "Change") +
+  theme_minimal()
+
+
+```
+
+## Question 86
+
+*How do you expect the value of your catch to develop in the next two years?*
+
+Possible answers:
+
+1.  Much worse
+
+2.  Slightly worse
+
+3.  Neither better or worse
+
+4.  Slightly better
+
+5.  Much better
+
+```{r}
+# Find data
+# colnames(fastfield)[grepl("86", colnames(fastfield))]
+# colnames(kobo_1_fp)[grepl("future_economic", colnames(kobo_1_fp))]
+# colnames(kobo_2_fp_hon)[grepl("future_economic", colnames(kobo_2_fp_hon))] 
+
+# Select Q24, site, year
+fastfield_q86 <- fastfield %>% 
+  select(ma_name, year, '86_future_economic')
+fastfield_q86$'86_future_economic'<- tolower(gsub(" ", "_", fastfield_q86$'86_future_economic'))
+
+kobo_1_fp_q86 <- kobo_1_fp %>% 
+  select(ma_name, year, '86_future_economic')
+kobo_1_fp_q86$'86_future_economic'<- tolower(gsub(" ", "_", kobo_1_fp_q86$'86_future_economic'))
+
+kobo_2_fp_hon_q86 <- kobo_2_fp_hon %>%
+  select(ma_name, year, '58_future_economic') # here is the question 19!
+kobo_2_fp_hon_q86$'86_future_economic'<- tolower(gsub(" ", "_", kobo_2_fp_hon_q86$'58_future_economic')) #change column name
+kobo_2_fp_hon_q86 <- kobo_2_fp_hon_q86 %>%
+  select(ma_name, year, '86_future_economic')
+
+# Check answers
+# Possible answers:
+# 1. Much worse
+# 2. Slightly worse
+# 3. Neither better or worse
+# 4. Slightly better
+# 5. Much better
+# unique(fastfield_q86$`86_future_economic`)
+# unique(kobo_1_fp_q86$`86_future_economic`)
+# unique(kobo_2_fp_hon_q86$`86_future_economic`)
+ 
+# Combine datasets
+q86 <- bind_rows(
+  select(fastfield_q86, ma_name, year, `86_future_economic`),
+  select(kobo_1_fp_q86, ma_name, year, `86_future_economic`),
+  select(kobo_2_fp_hon_q86, ma_name, year, `86_future_economic`)
+)
+
+
+# Remove answers like "not a fisher", NAs, etc
+answers_q86 <- c("much_worse", "slightly_worse", "neither", "slightly_better", "much_better")
+q86 <- q86 %>%
+  filter(`86_future_economic` %in% answers_q86)
+
+# Check different years for each ma_name
+q_86_years_by_site <- q86 %>%
+  group_by(ma_name) %>%
+  summarise(years = list(unique(year)))
+
+# Remove sites with only one hhs (year)
+q86 <- q86 %>%
+  group_by(ma_name) %>%
+  filter(n_distinct(year) > 1) %>%
+  ungroup() 
+
+# Ordinal to continuous mapping (answers in a continuos scale 0-100)
+q86 <- q86 %>%
+  mutate(q86_continuous = case_when(
+    `86_future_economic` == "much_worse" ~ 0,
+    `86_future_economic` == "slightly_worse" ~ 25,
+    `86_future_economic` == "neither" ~ 50,
+    `86_future_economic` == "slightly_better" ~ 75,
+    `86_future_economic` == "much_better" ~ 100
+  )) %>% 
+  group_by(ma_name) %>%
+  mutate(period = case_when(
+    year == min(year) ~ "before",
+    year == max(year) ~ "after"
+  )) %>%
+  ungroup()
+
+# Calculate average of q24 per site per year
+q86_summary <- q86 %>%
+  group_by(ma_name, year, period) %>%
+  summarise(avg_q86_continuous = mean(q86_continuous, na.rm = TRUE)) %>%
+  ungroup()
+
+
+before_after_avg_q86 <- q86_summary %>%
+  group_by(period) %>%
+  summarise(overall_avg_q86 = mean(avg_q86_continuous, na.rm = TRUE))
+
+
+# Custom function for linear regression with robust standard errors
+q86 <- q86 %>%
+  mutate(period = factor(period, levels = c("before", "after")))
+
+lm_robust <- function(df) {
+  lm(q86_continuous ~ period, data = df) %>%
+    coeftest(vcov = sandwich::vcovHC(., "HC1")) # Robust standard errors (HC1 correction)
+}
+
+# Run the regression for each site and extract the before-after coefficient
+before_after_models_q86 <- q86 %>%
+  group_by(ma_name) %>%
+  do(tidy(lm(q86_continuous ~ period, data = .), conf.int = TRUE)) %>%
+  filter(term == "periodafter")
+
+# Add 95% confidence intervals
+before_after_models_q86 <- before_after_models_q86 %>%
+  mutate(conf.high.95 = estimate + 1.96 * std.error,
+         conf.low.95 = estimate - 1.96 * std.error)
+
+# Plot the effect size (β1) for each site
+before_after_models_q86 <- before_after_models_q86 %>%
+  mutate(
+    significance = case_when(
+      p.value < 0.05 & estimate > 0 ~ "Positive (p < 0.05)",
+      p.value < 0.05 & estimate < 0 ~ "Negative (p < 0.05)",
+      p.value >= 0.05 ~ "Not Significant"
+    ),
+    # Set colors for plotting
+    color = case_when(
+      p.value < 0.05 & estimate > 0 ~ "forestgreen",    
+      p.value < 0.05 & estimate < 0 ~ "purple",         
+      p.value >= 0.05 ~ "white"                       
+    )
+  )
+
+before_after_models_q86 %>%
+  ggplot(aes(x = reorder(ma_name, estimate), y = estimate, fill = significance)) +
+  geom_point(shape = 21, size = 3, color = "black") +  
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.2) +
+  scale_fill_manual(values = c("Positive (p < 0.05)" = "forestgreen", 
+                               "Negative (p < 0.05)" = "purple", 
+                               "Not Significant" = "white")) +  
+  coord_flip() +
+  labs(x = "Site", y = "Effect Size (β1)", 
+       title = "Before–after standardized effect sizes for Q86 by Site", #change title
+       fill = "Change") +
+  theme_minimal()
+
+
+
+
+```
+
+## Question 90
+
+*Thinking of your household’s total income, is your household able to cover your household's needs...?*
+
+Possible answers:
+
+1.  With great difficulty
+
+2.  With difficulty
+
+3.  Fairly easy
+
+4.  Easy
+
+5.  Very easy
+
+```{r}
+# Find data
+# colnames(fastfield)[grepl("90", colnames(fastfield))]
+# colnames(kobo_1_fp)[grepl("ends_meet", colnames(kobo_1_fp))]
+# colnames(kobo_2_fp_hon)[grepl("ends_meet", colnames(kobo_2_fp_hon))]
+
+# Select Q24, site, year
+fastfield_q90 <- fastfield %>% 
+  select(ma_name, year, '90_hh_ends_meet')
+fastfield_q90$'90_hh_ends_meet'<- tolower(gsub(" ", "_", fastfield_q90$'90_hh_ends_meet'))
+
+kobo_1_fp_q90 <- kobo_1_fp %>% 
+  select(ma_name, year, '90_hh_ends_meet')
+kobo_1_fp_q90$'90_hh_ends_meet'<- tolower(gsub(" ", "_", kobo_1_fp_q90$'90_hh_ends_meet'))
+
+kobo_2_fp_hon_q90 <- kobo_2_fp_hon %>% 
+  select(ma_name, year, '61_hh_ends_meet') # here is the question 19!
+kobo_2_fp_hon_q90$'90_hh_ends_meet'<- tolower(gsub(" ", "_", kobo_2_fp_hon_q90$'61_hh_ends_meet')) #change column name
+kobo_2_fp_hon_q90 <- kobo_2_fp_hon_q90 %>% 
+  select(ma_name, year, '90_hh_ends_meet')
+
+# Check answers
+# Possible answers:
+# 1. With great difficulty
+# 2. With difficulty
+# 3. Fairly easy
+# 4. Easy
+# 5. Very easy
+# unique(fastfield_q90$`90_hh_ends_meet`)
+# unique(kobo_1_fp_q90$`90_hh_ends_meet`)
+# unique(kobo_2_fp_hon_q90$`90_hh_ends_meet`)
+ 
+# Combine datasets
+q90 <- bind_rows(
+  select(fastfield_q90, ma_name, year, `90_hh_ends_meet`),
+  select(kobo_1_fp_q90, ma_name, year, `90_hh_ends_meet`),
+  select(kobo_2_fp_hon_q90, ma_name, year, `90_hh_ends_meet`)
+)
+
+
+# Remove answers like "not a fisher", NAs, etc
+answers_q90 <- c("with_great_difficulty", "with_difficulty", "fairly_easy", "easy", "very_easy")
+q90 <- q90 %>%
+  filter(`90_hh_ends_meet` %in% answers_q90)
+
+# Check different years for each ma_name
+q_90_years_by_site <- q90 %>%
+  group_by(ma_name) %>%
+  summarise(years = list(unique(year)))
+
+# Remove sites with only one hhs (year)
+q90 <- q90 %>%
+  group_by(ma_name) %>%
+  filter(n_distinct(year) > 1) %>%
+  ungroup() 
+
+# Ordinal to continuous mapping (answers in a continuos scale 0-100)
+q90 <- q90 %>%
+  mutate(q90_continuous = case_when(
+    `90_hh_ends_meet` == "with_great_difficulty" ~ 0,
+    `90_hh_ends_meet` == "with_difficulty" ~ 25,
+    `90_hh_ends_meet` == "fairly_easy" ~ 50,
+    `90_hh_ends_meet` == "easy" ~ 75,
+    `90_hh_ends_meet` == "very_easy" ~ 100
+  )) %>% 
+  group_by(ma_name) %>%
+  mutate(period = case_when(
+    year == min(year) ~ "before",
+    year == max(year) ~ "after"
+  )) %>%
+  ungroup()
+
+# Calculate average of q24 per site per year
+q90_summary <- q90 %>%
+  group_by(ma_name, year, period) %>%
+  summarise(avg_q90_continuous = mean(q90_continuous, na.rm = TRUE)) %>%
+  ungroup()
+
+
+before_after_avg_q90 <- q90_summary %>%
+  group_by(period) %>%
+  summarise(overall_avg_q90 = mean(avg_q90_continuous, na.rm = TRUE))
+
+
+# Custom function for linear regression with robust standard errors
+q90 <- q90 %>%
+  mutate(period = factor(period, levels = c("before", "after")))
+
+lm_robust <- function(df) {
+  lm(q90_continuous ~ period, data = df) %>%
+    coeftest(vcov = sandwich::vcovHC(., "HC1")) # Robust standard errors (HC1 correction)
+}
+
+# Run the regression for each site and extract the before-after coefficient
+before_after_models_q90 <- q90 %>%
+  group_by(ma_name) %>%
+  do(tidy(lm(q90_continuous ~ period, data = .), conf.int = TRUE)) %>%
+  filter(term == "periodafter")
+
+# Add 95% confidence intervals
+before_after_models_q90 <- before_after_models_q90 %>%
+  mutate(conf.high.95 = estimate + 1.96 * std.error,
+         conf.low.95 = estimate - 1.96 * std.error)
+
+# Plot the effect size (β1) for each site
+before_after_models_q90 <- before_after_models_q90 %>%
+  mutate(
+    significance = case_when(
+      p.value < 0.05 & estimate > 0 ~ "Positive (p < 0.05)",
+      p.value < 0.05 & estimate < 0 ~ "Negative (p < 0.05)",
+      p.value >= 0.05 ~ "Not Significant"
+    ),
+    # Set colors for plotting
+    color = case_when(
+      p.value < 0.05 & estimate > 0 ~ "forestgreen",    
+      p.value < 0.05 & estimate < 0 ~ "purple",         
+      p.value >= 0.05 ~ "white"                       
+    )
+  )
+
+before_after_models_q90 %>%
+  ggplot(aes(x = reorder(ma_name, estimate), y = estimate, fill = significance)) +
+  geom_point(shape = 21, size = 3, color = "black") +  
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.2) +
+  scale_fill_manual(values = c("Positive (p < 0.05)" = "forestgreen", 
+                               "Negative (p < 0.05)" = "purple", 
+                               "Not Significant" = "white")) +  
+  coord_flip() +
+  labs(x = "Site", y = "Effect Size (β1)", 
+       title = "Before–after standardized effect sizes for Q90 by Site", #change title
+       fill = "Change") +
+  theme_minimal()
+
+
+```
+
+## All HHS Questions by Site
+
+```{r}
+# Combine the two datasets as before
+combined_models <- bind_rows(
+  before_after_models %>% mutate(question = "Q21"),
+  before_after_models_q24 %>% mutate(question = "Q24"),
+  before_after_models_q25 %>% mutate(question = "Q25"),
+  before_after_models_q53 %>% mutate(question = "Q53"),
+  before_after_models_q58 %>% mutate(question = "Q58"),
+  before_after_models_q61 %>% mutate(question = "Q61"),
+  before_after_models_q66 %>% mutate(question = "Q66"),
+  before_after_models_q72 %>% mutate(question = "Q72"),
+  before_after_models_q73 %>% mutate(question = "Q73"),
+  before_after_models_q85 %>% mutate(question = "Q85"),
+  before_after_models_q86 %>% mutate(question = "Q86"),
+  before_after_models_q90 %>% mutate(question = "Q90")
+)
+
+unique_sites <- unique(combined_models$ma_name)
+
+# Loop through each site and create a separate plot
+for (site in unique_sites) {
+  site_data <- combined_models %>% filter(ma_name == site)
+  
+  p <- ggplot(site_data, aes(x = estimate, y = question, fill = significance)) +
+    geom_point(shape = 21, size = 3, color = "black") +  
+    geom_errorbarh(aes(xmin = conf.low.95, xmax = conf.high.95), height = 0.2) +
+    scale_fill_manual(values = c("Positive (p < 0.05)" = "forestgreen", 
+                                 "Negative (p < 0.05)" = "purple", 
+                                 "Not Significant" = "white")) +  
+    labs(x = "Effect Size (β1)", y = "Question", 
+         title = paste("Before–after standardized effect sizes for different HHS questions at", site),
+         fill = "Significance") +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+  
+  print(p)
+}
+```
